@@ -129,12 +129,81 @@ async def list_events(date_from, date_to):
 
 
 # ── Kino.kz ──────────────────────────────────────────────
+import re
 CITY_SLUGS = {"алматы": "almaty", "астана": "astana", "шымкент": "shymkent", "караганда": "karaganda"}
 KINO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json, text/html, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
+
+
+def extract_next_data(html: str) -> dict | None:
+    """Extract __NEXT_DATA__ JSON from Next.js page."""
+    match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except:
+            pass
+    return None
+
+
+def deep_search_keys(obj, target_keys, depth=0, max_depth=6):
+    """Recursively search for keys in nested dict/list structure."""
+    results = {}
+    if depth > max_depth:
+        return results
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if key in target_keys:
+                results[key] = val
+            child = deep_search_keys(val, target_keys, depth + 1, max_depth)
+            results.update(child)
+    elif isinstance(obj, list):
+        for item in obj[:20]:
+            child = deep_search_keys(item, target_keys, depth + 1, max_depth)
+            results.update(child)
+    return results
+
+
+async def fetch_kino_page(client, url):
+    """Fetch a kino.kz page and log details."""
+    resp = await client.get(url)
+    logger.info(f"Kino fetch {url} -> status={resp.status_code}, length={len(resp.text)}")
+    
+    next_data = extract_next_data(resp.text)
+    if next_data:
+        # Log structure for debugging
+        props = next_data.get("props", {})
+        page_props = props.get("pageProps", {})
+        logger.info(f"__NEXT_DATA__ found! pageProps keys: {list(page_props.keys())[:20]}")
+        
+        # Log deeper structure
+        for key, val in page_props.items():
+            if isinstance(val, list):
+                logger.info(f"  pageProps['{key}'] = list of {len(val)} items")
+                if val and isinstance(val[0], dict):
+                    logger.info(f"    first item keys: {list(val[0].keys())[:15]}")
+            elif isinstance(val, dict):
+                logger.info(f"  pageProps['{key}'] = dict with keys: {list(val.keys())[:15]}")
+            else:
+                logger.info(f"  pageProps['{key}'] = {type(val).__name__}: {str(val)[:100]}")
+        
+        return next_data, page_props
+    
+    # No __NEXT_DATA__, log what scripts are on page
+    script_srcs = re.findall(r'<script[^>]*src="([^"]*)"', resp.text)
+    logger.info(f"No __NEXT_DATA__. Scripts on page: {len(script_srcs)}")
+    for src in script_srcs[:5]:
+        logger.info(f"  script: {src}")
+    
+    # Log any inline JSON data
+    json_matches = re.findall(r'(?:window\.__\w+__|self\.__next)\s*=\s*(\{.{20,500})', resp.text)
+    for jm in json_matches[:3]:
+        logger.info(f"  inline JSON found: {jm[:200]}")
+    
+    return None, {}
 
 
 async def search_movie_sessions(movie, city="Алматы", cinema="", date=""):
@@ -145,246 +214,225 @@ async def search_movie_sessions(movie, city="Алматы", cinema="", date=""):
 
     async with httpx.AsyncClient(timeout=25, headers=KINO_HEADERS, follow_redirects=True) as client:
         try:
-            # Approach 1: Try API endpoints
-            api_urls = [
-                f"{kino_base}/api/movie/search?query={movie}&city={city_slug}",
-                f"{kino_base}/api/v1/movies?city={city_slug}&query={movie}",
-                f"{kino_base}/api/movies/search?q={movie}&city={city_slug}",
+            # Step 1: Fetch main city page to get movie listings
+            main_urls = [
+                f"{kino_base}/ru/{city_slug}",
+                f"{kino_base}/{city_slug}",
+                f"{kino_base}/ru/{city_slug}/movies",
+                f"{kino_base}/{city_slug}/movies",
             ]
             
-            api_data = None
-            for api_url in api_urls:
-                try:
-                    resp = await client.get(api_url)
-                    logger.info(f"Kino API {api_url} -> status={resp.status_code}")
-                    if resp.status_code == 200:
-                        try:
-                            api_data = resp.json()
-                            logger.info(f"Kino API JSON keys: {list(api_data.keys()) if isinstance(api_data, dict) else type(api_data)}")
-                            break
-                        except:
-                            pass
-                except Exception as e:
-                    logger.info(f"Kino API {api_url} failed: {e}")
-
-            # Approach 2: Parse HTML page and look for embedded JSON data
-            resp = await client.get(f"{kino_base}/{city_slug}/search", params={"query": movie})
-            logger.info(f"Kino search page status={resp.status_code}, length={len(resp.text)}")
-            page_text = resp.text
-
-            # Look for __NEXT_DATA__ or similar embedded JSON (Next.js/Nuxt.js pattern)
-            import re
-            movies_found = []
-
-            # Try __NEXT_DATA__
-            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page_text, re.DOTALL)
-            if next_data_match:
-                try:
-                    next_data = json.loads(next_data_match.group(1))
-                    logger.info(f"Found __NEXT_DATA__, keys: {list(next_data.get('props', {}).get('pageProps', {}).keys())[:10]}")
-                    # Extract movies from Next.js data
-                    page_props = next_data.get("props", {}).get("pageProps", {})
-                    for key in ["movies", "results", "items", "data", "searchResults"]:
-                        if key in page_props:
-                            items = page_props[key]
-                            if isinstance(items, list):
-                                for item in items:
-                                    title = item.get("title") or item.get("name") or item.get("nameRu") or ""
-                                    slug = item.get("slug") or item.get("id") or ""
-                                    movies_found.append({"title": title, "slug": str(slug), "data": item})
-                except Exception as e:
-                    logger.info(f"__NEXT_DATA__ parse error: {e}")
-
-            # Try nuxt/vue data patterns
-            if not movies_found:
-                nuxt_match = re.search(r'window\.__NUXT__\s*=\s*(\{.*?\});?\s*</script>', page_text, re.DOTALL)
-                if nuxt_match:
-                    logger.info("Found __NUXT__ data")
-
-            # Try any JSON blocks with movie data
-            if not movies_found:
-                json_blocks = re.findall(r'\{[^{}]*"(?:title|name|nameRu)"[^{}]*"(?:slug|id)"[^{}]*\}', page_text)
-                for block in json_blocks[:20]:
-                    try:
-                        item = json.loads(block)
-                        title = item.get("title") or item.get("name") or item.get("nameRu") or ""
-                        if title and movie_lower in title.lower():
-                            movies_found.append({"title": title, "slug": str(item.get("slug", item.get("id", ""))), "data": item})
-                    except:
-                        pass
-
-            # Approach 3: Standard HTML parsing with broader selectors
-            if not movies_found:
-                soup = BeautifulSoup(page_text, "html.parser")
-                # Log page structure for debugging
-                all_links = soup.select("a[href]")
-                logger.info(f"Total links on page: {len(all_links)}")
-                movie_links = [a for a in all_links if any(x in a.get("href", "") for x in ["/movie/", "/film/", "/movies/"])]
-                logger.info(f"Movie links found: {len(movie_links)}")
-                for a in movie_links[:10]:
-                    logger.info(f"  Link: href={a.get('href')}, text={a.get_text(strip=True)[:50]}")
-
-                for link in all_links:
-                    href = link.get("href", "")
-                    text = link.get_text(strip=True)
-                    if any(x in href for x in ["/movie/", "/film/", "/movies/"]) and text:
-                        movies_found.append({"title": text, "slug": href, "data": {}})
-
-                # Also try broader search without exact name match
-                if not movies_found:
-                    for link in all_links:
-                        href = link.get("href", "")
-                        text = link.get_text(strip=True)
-                        if text and len(text) > 3 and movie_lower in text.lower():
-                            movies_found.append({"title": text, "slug": href, "data": {}})
-
-            if not movies_found:
-                # Log page snippet for debugging
-                logger.info(f"Page text snippet (first 500 chars): {page_text[:500]}")
+            all_movies = []
+            page_props = {}
+            
+            for url in main_urls:
+                next_data, pp = await fetch_kino_page(client, url)
+                if pp:
+                    page_props = pp
+                    # Search for movie lists in all values
+                    movie_keys = ["movies", "films", "items", "data", "nowShowing", 
+                                  "releases", "results", "allMovies", "moviesList",
+                                  "coming", "showing", "premieres"]
+                    
+                    for key in movie_keys:
+                        if key in pp and isinstance(pp[key], list):
+                            for item in pp[key]:
+                                if isinstance(item, dict):
+                                    title = (item.get("title") or item.get("name") or 
+                                            item.get("nameRu") or item.get("originalTitle") or "")
+                                    slug = (item.get("slug") or item.get("id") or 
+                                           item.get("movieId") or "")
+                                    if title:
+                                        all_movies.append({
+                                            "title": title, 
+                                            "slug": str(slug),
+                                            "data": item
+                                        })
+                    
+                    # Also search deeper in nested structures
+                    found = deep_search_keys(pp, set(movie_keys))
+                    for key, val in found.items():
+                        if isinstance(val, list):
+                            for item in val:
+                                if isinstance(item, dict):
+                                    title = (item.get("title") or item.get("name") or 
+                                            item.get("nameRu") or "")
+                                    slug = (item.get("slug") or item.get("id") or "")
+                                    if title and not any(m["title"] == title for m in all_movies):
+                                        all_movies.append({"title": title, "slug": str(slug), "data": item})
+                    
+                    if all_movies:
+                        break
+            
+            logger.info(f"Total movies found on kino.kz: {len(all_movies)}")
+            for m in all_movies[:10]:
+                logger.info(f"  Movie: '{m['title']}', slug='{m['slug']}'")
+            
+            # Step 2: Find matching movie
+            matches = []
+            for m in all_movies:
+                if movie_lower in m["title"].lower():
+                    matches.append(m)
+            
+            # Fuzzy match if exact not found
+            if not matches:
+                for m in all_movies:
+                    title_words = set(m["title"].lower().split())
+                    search_words = set(movie_lower.split())
+                    if search_words & title_words:
+                        matches.append(m)
+            
+            if not matches:
+                movie_list = ", ".join(m["title"] for m in all_movies[:10])
                 return {
                     "sessions": [],
-                    "message": f"Фильм '{movie}' не найден на Kino.kz. Попробуйте поискать вручную.",
-                    "kino_url": f"{kino_base}/{city_slug}",
-                    "direct_search_url": f"{kino_base}/{city_slug}/search?query={movie}",
+                    "message": f"Фильм '{movie}' не найден.",
+                    "available_movies": movie_list if all_movies else "Не удалось загрузить список фильмов",
+                    "kino_url": f"{kino_base}/ru/{city_slug}",
                 }
-
-            best = movies_found[0]
-            logger.info(f"Best match: {best['title']}, slug={best['slug']}")
-
-            # Build movie URL and get sessions
-            movie_url = best["slug"]
-            if not movie_url.startswith("http"):
-                if not movie_url.startswith("/"):
-                    movie_url = f"/{movie_url}"
-                movie_url = f"{kino_base}{movie_url}"
-
-            # Try to get sessions page
-            resp = await client.get(movie_url, params={"date": target_date})
-            logger.info(f"Movie page status={resp.status_code}, length={len(resp.text)}")
-            session_text = resp.text
-
+            
+            best = matches[0]
+            logger.info(f"Best match: '{best['title']}', slug='{best['slug']}'")
+            
+            # Step 3: Try to get sessions
+            movie_url = f"{kino_base}/ru/{city_slug}/movie/{best['slug']}"
             sessions = []
-
-            # Try extracting sessions from embedded JSON
-            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', session_text, re.DOTALL)
-            if next_data_match:
-                try:
-                    next_data = json.loads(next_data_match.group(1))
-                    page_props = next_data.get("props", {}).get("pageProps", {})
-                    for key in ["sessions", "showtimes", "schedules", "seances"]:
-                        if key in page_props:
-                            for s in page_props[key]:
-                                sessions.append({
-                                    "cinema": s.get("cinemaName") or s.get("cinema", {}).get("name", "—"),
-                                    "time": s.get("time") or s.get("startTime", ""),
-                                    "format": s.get("format") or s.get("technology", ""),
-                                    "price": s.get("price") or s.get("minPrice", ""),
-                                    "buy_url": f"{kino_base}/{city_slug}/session/{s.get('id', '')}" if s.get("id") else movie_url,
-                                })
-                except Exception as e:
-                    logger.info(f"Session __NEXT_DATA__ error: {e}")
-
-            # Try HTML parsing for sessions
+            
+            # Check if session data is already in the movie data
+            movie_data = best.get("data", {})
+            for key in ["sessions", "showtimes", "schedules", "seances"]:
+                if key in movie_data and isinstance(movie_data[key], list):
+                    for s in movie_data[key]:
+                        if isinstance(s, dict):
+                            sessions.append({
+                                "cinema": s.get("cinemaName") or s.get("cinema", {}).get("name", "—") if isinstance(s.get("cinema"), dict) else s.get("cinema", "—"),
+                                "time": s.get("time") or s.get("startTime", ""),
+                                "format": s.get("format") or s.get("technology", ""),
+                                "price": str(s.get("price") or s.get("minPrice", "")),
+                                "buy_url": f"{kino_base}/ru/{city_slug}/session/{s.get('id', '')}" if s.get("id") else movie_url,
+                            })
+            
+            # If no sessions in data, fetch movie page
             if not sessions:
-                soup = BeautifulSoup(session_text, "html.parser")
-                all_elements = soup.select("[class*='session'], [class*='showtime'], [class*='seance'], [class*='schedule'], [class*='cinema'], [data-session], [data-showtime]")
-                logger.info(f"Session elements found: {len(all_elements)}")
-                for el in all_elements[:5]:
-                    logger.info(f"  Session element: tag={el.name}, class={el.get('class')}, text={el.get_text(strip=True)[:80]}")
-
+                _, movie_pp = await fetch_kino_page(client, movie_url)
+                if movie_pp:
+                    for key in ["sessions", "showtimes", "schedules", "seances", "shows"]:
+                        if key in movie_pp and isinstance(movie_pp[key], list):
+                            for s in movie_pp[key]:
+                                if isinstance(s, dict):
+                                    sessions.append({
+                                        "cinema": s.get("cinemaName") or (s.get("cinema", {}).get("name", "—") if isinstance(s.get("cinema"), dict) else s.get("cinema", "—")),
+                                        "time": s.get("time") or s.get("startTime", ""),
+                                        "format": s.get("format") or s.get("technology", ""),
+                                        "price": str(s.get("price") or s.get("minPrice", "")),
+                                        "buy_url": f"{kino_base}/ru/{city_slug}/session/{s.get('id', '')}" if s.get("id") else movie_url,
+                                    })
+                    
+                    # Deep search for sessions
+                    if not sessions:
+                        found = deep_search_keys(movie_pp, {"sessions", "showtimes", "schedules", "seances"})
+                        for key, val in found.items():
+                            if isinstance(val, list):
+                                for s in val:
+                                    if isinstance(s, dict) and (s.get("time") or s.get("startTime")):
+                                        sessions.append({
+                                            "cinema": s.get("cinemaName") or s.get("cinema", "—"),
+                                            "time": s.get("time") or s.get("startTime", ""),
+                                            "buy_url": movie_url,
+                                        })
+            
             if cinema and sessions:
-                cinema_lower = cinema.lower()
-                sessions = [s for s in sessions if cinema_lower in s.get("cinema", "").lower()]
-
+                sessions = [s for s in sessions if cinema.lower() in s.get("cinema", "").lower()]
+            
+            logger.info(f"Sessions found: {len(sessions)}")
+            
             return {
                 "movie": best["title"],
                 "date": target_date,
                 "sessions": sessions,
                 "count": len(sessions),
                 "movie_url": movie_url,
-                "direct_search_url": f"{kino_base}/{city_slug}/search?query={movie}",
             }
 
         except Exception as e:
-            logger.error(f"Kino.kz error: {e}")
+            logger.error(f"Kino.kz error: {e}", exc_info=True)
             return {
                 "error": str(e),
-                "kino_url": f"{kino_base}/{city_slug}",
-                "message": f"Ошибка при поиске. Прямая ссылка: {kino_base}/{city_slug}",
+                "kino_url": f"{kino_base}/ru/{city_slug}",
+                "message": f"Ошибка. Прямая ссылка: {kino_base}/ru/{city_slug}",
             }
 
 
 async def list_cinema_movies(city="Алматы", cinema=""):
-    """List all movies currently showing, optionally filtered by cinema."""
+    """List all movies currently showing."""
     city_slug = CITY_SLUGS.get(city.lower().strip(), "almaty")
     kino_base = "https://kino.kz"
-    today = datetime.now().strftime("%Y-%m-%d")
 
     async with httpx.AsyncClient(timeout=25, headers=KINO_HEADERS, follow_redirects=True) as client:
         try:
-            # Try main page which usually lists current movies
-            url = f"{kino_base}/{city_slug}"
-            if cinema:
-                url = f"{kino_base}/{city_slug}/cinema/{cinema.lower().replace(' ', '-')}"
-
-            resp = await client.get(url)
-            logger.info(f"Cinema page status={resp.status_code}, length={len(resp.text)}")
-            page_text = resp.text
-
-            movies = []
-            import re
-
-            # Try __NEXT_DATA__
-            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page_text, re.DOTALL)
-            if next_data_match:
-                try:
-                    next_data = json.loads(next_data_match.group(1))
-                    page_props = next_data.get("props", {}).get("pageProps", {})
-                    logger.info(f"Cinema page pageProps keys: {list(page_props.keys())[:15]}")
-                    for key in ["movies", "films", "items", "data", "nowShowing", "releases"]:
-                        if key in page_props:
-                            items = page_props[key]
-                            if isinstance(items, list):
-                                for item in items:
-                                    title = item.get("title") or item.get("name") or item.get("nameRu") or ""
+            urls = [
+                f"{kino_base}/ru/{city_slug}",
+                f"{kino_base}/{city_slug}",
+            ]
+            
+            all_movies = []
+            
+            for url in urls:
+                _, pp = await fetch_kino_page(client, url)
+                if pp:
+                    movie_keys = ["movies", "films", "items", "data", "nowShowing", 
+                                  "releases", "allMovies", "moviesList", "showing", "premieres"]
+                    
+                    for key in movie_keys:
+                        if key in pp and isinstance(pp[key], list):
+                            for item in pp[key]:
+                                if isinstance(item, dict):
+                                    title = (item.get("title") or item.get("name") or 
+                                            item.get("nameRu") or "")
                                     if title:
-                                        movies.append({
+                                        all_movies.append({
                                             "title": title,
-                                            "genre": item.get("genre") or item.get("genres", ""),
-                                            "rating": item.get("rating") or item.get("imdbRating", ""),
-                                            "url": f"{kino_base}/{city_slug}/movie/{item.get('slug', item.get('id', ''))}",
+                                            "genre": str(item.get("genre") or item.get("genres", "")),
+                                            "rating": str(item.get("rating") or item.get("imdbRating", "")),
+                                            "url": f"{kino_base}/ru/{city_slug}/movie/{item.get('slug', item.get('id', ''))}",
                                         })
-                except Exception as e:
-                    logger.info(f"Cinema __NEXT_DATA__ error: {e}")
-
-            # Fallback: HTML parsing
-            if not movies:
-                soup = BeautifulSoup(page_text, "html.parser")
-                for link in soup.select("a[href*='/movie/'], a[href*='/film/']"):
-                    text = link.get_text(strip=True)
-                    href = link.get("href", "")
-                    if text and len(text) > 2:
-                        full_url = href if href.startswith("http") else f"{kino_base}{href}"
-                        movies.append({"title": text, "url": full_url})
-
-            # Deduplicate by title
+                    
+                    # Deep search
+                    found = deep_search_keys(pp, set(movie_keys))
+                    for key, val in found.items():
+                        if isinstance(val, list):
+                            for item in val:
+                                if isinstance(item, dict):
+                                    title = (item.get("title") or item.get("name") or 
+                                            item.get("nameRu") or "")
+                                    if title and not any(m["title"] == title for m in all_movies):
+                                        all_movies.append({
+                                            "title": title,
+                                            "url": f"{kino_base}/ru/{city_slug}/movie/{item.get('slug', item.get('id', ''))}",
+                                        })
+                    
+                    if all_movies:
+                        break
+            
+            # Deduplicate
             seen = set()
-            unique_movies = []
-            for m in movies:
+            unique = []
+            for m in all_movies:
                 if m["title"] not in seen:
                     seen.add(m["title"])
-                    unique_movies.append(m)
-
+                    unique.append(m)
+            
+            logger.info(f"Listed {len(unique)} movies for {city}")
+            
             return {
-                "movies": unique_movies[:20],
-                "count": len(unique_movies),
+                "movies": unique[:20],
+                "count": len(unique),
                 "city": city,
-                "cinema": cinema or "все кинотеатры",
-                "kino_url": f"{kino_base}/{city_slug}",
+                "kino_url": f"{kino_base}/ru/{city_slug}",
             }
         except Exception as e:
-            logger.error(f"Cinema listing error: {e}")
-            return {"error": str(e), "kino_url": f"{kino_base}/{city_slug}"}
+            logger.error(f"Cinema listing error: {e}", exc_info=True)
+            return {"error": str(e), "kino_url": f"{kino_base}/ru/{city_slug}"}
 
 
 # ── Voice transcription ──────────────────────────────────
