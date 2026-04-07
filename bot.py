@@ -34,14 +34,15 @@ SYSTEM_PROMPT = f"""Ты — персональный ИИ-помощник в T
 
 ВОЗМОЖНОСТИ:
 1. Google Calendar — создавать, просматривать встречи
-2. Кино — искать сеансы на Kino.kz, давать ссылку на покупку
+2. Кино — искать сеансы конкретного фильма на Kino.kz, показывать все фильмы в прокате, давать ссылку на покупку
 
 ПРАВИЛА:
 - Отвечай коротко, как живой помощник в мессенджере
 - Если не указано время окончания встречи — ставь +1 час
 - Если не указана дата — предположи сегодня/завтра
 - Город по умолчанию — Алматы
-- При поиске кино дай ссылку на покупку с Kino.kz
+- При поиске кино: если пользователь называет конкретный фильм — используй search_movie_sessions, если спрашивает что идёт в кино — используй list_cinema_movies
+- Если поиск на Kino.kz не нашёл фильм — дай прямую ссылку на поиск
 - Никогда не показывай JSON, ID, технические данные
 - Используй эмодзи умеренно: 📅 🎬
 - Ссылки оформляй как [текст](url)
@@ -129,52 +130,261 @@ async def list_events(date_from, date_to):
 
 # ── Kino.kz ──────────────────────────────────────────────
 CITY_SLUGS = {"алматы": "almaty", "астана": "astana", "шымкент": "shymkent", "караганда": "karaganda"}
+KINO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
 
 
 async def search_movie_sessions(movie, city="Алматы", cinema="", date=""):
     city_slug = CITY_SLUGS.get(city.lower().strip(), "almaty")
     target_date = date or datetime.now().strftime("%Y-%m-%d")
     kino_base = "https://kino.kz"
+    movie_lower = movie.lower().strip()
 
-    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"}) as client:
+    async with httpx.AsyncClient(timeout=25, headers=KINO_HEADERS, follow_redirects=True) as client:
         try:
-            # Search movie
+            # Approach 1: Try API endpoints
+            api_urls = [
+                f"{kino_base}/api/movie/search?query={movie}&city={city_slug}",
+                f"{kino_base}/api/v1/movies?city={city_slug}&query={movie}",
+                f"{kino_base}/api/movies/search?q={movie}&city={city_slug}",
+            ]
+            
+            api_data = None
+            for api_url in api_urls:
+                try:
+                    resp = await client.get(api_url)
+                    logger.info(f"Kino API {api_url} -> status={resp.status_code}")
+                    if resp.status_code == 200:
+                        try:
+                            api_data = resp.json()
+                            logger.info(f"Kino API JSON keys: {list(api_data.keys()) if isinstance(api_data, dict) else type(api_data)}")
+                            break
+                        except:
+                            pass
+                except Exception as e:
+                    logger.info(f"Kino API {api_url} failed: {e}")
+
+            # Approach 2: Parse HTML page and look for embedded JSON data
             resp = await client.get(f"{kino_base}/{city_slug}/search", params={"query": movie})
-            soup = BeautifulSoup(resp.text, "html.parser")
+            logger.info(f"Kino search page status={resp.status_code}, length={len(resp.text)}")
+            page_text = resp.text
 
-            movies = []
-            for link in soup.select("a[href]"):
-                href = link.get("href", "")
-                text = link.get_text(strip=True)
-                if ("/movie/" in href or "/film/" in href) and text and movie.lower() in text.lower():
-                    movies.append({"title": text, "url": href})
+            # Look for __NEXT_DATA__ or similar embedded JSON (Next.js/Nuxt.js pattern)
+            import re
+            movies_found = []
 
-            if not movies:
-                return {"sessions": [], "message": f"Фильм '{movie}' не найден. Посмотрите на kino.kz/{city_slug}", "kino_url": f"{kino_base}/{city_slug}"}
+            # Try __NEXT_DATA__
+            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page_text, re.DOTALL)
+            if next_data_match:
+                try:
+                    next_data = json.loads(next_data_match.group(1))
+                    logger.info(f"Found __NEXT_DATA__, keys: {list(next_data.get('props', {}).get('pageProps', {}).keys())[:10]}")
+                    # Extract movies from Next.js data
+                    page_props = next_data.get("props", {}).get("pageProps", {})
+                    for key in ["movies", "results", "items", "data", "searchResults"]:
+                        if key in page_props:
+                            items = page_props[key]
+                            if isinstance(items, list):
+                                for item in items:
+                                    title = item.get("title") or item.get("name") or item.get("nameRu") or ""
+                                    slug = item.get("slug") or item.get("id") or ""
+                                    movies_found.append({"title": title, "slug": str(slug), "data": item})
+                except Exception as e:
+                    logger.info(f"__NEXT_DATA__ parse error: {e}")
 
-            best = movies[0]
-            url = f"{kino_base}{best['url']}" if not best["url"].startswith("http") else best["url"]
-            resp = await client.get(url, params={"date": target_date})
-            soup = BeautifulSoup(resp.text, "html.parser")
+            # Try nuxt/vue data patterns
+            if not movies_found:
+                nuxt_match = re.search(r'window\.__NUXT__\s*=\s*(\{.*?\});?\s*</script>', page_text, re.DOTALL)
+                if nuxt_match:
+                    logger.info("Found __NUXT__ data")
+
+            # Try any JSON blocks with movie data
+            if not movies_found:
+                json_blocks = re.findall(r'\{[^{}]*"(?:title|name|nameRu)"[^{}]*"(?:slug|id)"[^{}]*\}', page_text)
+                for block in json_blocks[:20]:
+                    try:
+                        item = json.loads(block)
+                        title = item.get("title") or item.get("name") or item.get("nameRu") or ""
+                        if title and movie_lower in title.lower():
+                            movies_found.append({"title": title, "slug": str(item.get("slug", item.get("id", ""))), "data": item})
+                    except:
+                        pass
+
+            # Approach 3: Standard HTML parsing with broader selectors
+            if not movies_found:
+                soup = BeautifulSoup(page_text, "html.parser")
+                # Log page structure for debugging
+                all_links = soup.select("a[href]")
+                logger.info(f"Total links on page: {len(all_links)}")
+                movie_links = [a for a in all_links if any(x in a.get("href", "") for x in ["/movie/", "/film/", "/movies/"])]
+                logger.info(f"Movie links found: {len(movie_links)}")
+                for a in movie_links[:10]:
+                    logger.info(f"  Link: href={a.get('href')}, text={a.get_text(strip=True)[:50]}")
+
+                for link in all_links:
+                    href = link.get("href", "")
+                    text = link.get_text(strip=True)
+                    if any(x in href for x in ["/movie/", "/film/", "/movies/"]) and text:
+                        movies_found.append({"title": text, "slug": href, "data": {}})
+
+                # Also try broader search without exact name match
+                if not movies_found:
+                    for link in all_links:
+                        href = link.get("href", "")
+                        text = link.get_text(strip=True)
+                        if text and len(text) > 3 and movie_lower in text.lower():
+                            movies_found.append({"title": text, "slug": href, "data": {}})
+
+            if not movies_found:
+                # Log page snippet for debugging
+                logger.info(f"Page text snippet (first 500 chars): {page_text[:500]}")
+                return {
+                    "sessions": [],
+                    "message": f"Фильм '{movie}' не найден на Kino.kz. Попробуйте поискать вручную.",
+                    "kino_url": f"{kino_base}/{city_slug}",
+                    "direct_search_url": f"{kino_base}/{city_slug}/search?query={movie}",
+                }
+
+            best = movies_found[0]
+            logger.info(f"Best match: {best['title']}, slug={best['slug']}")
+
+            # Build movie URL and get sessions
+            movie_url = best["slug"]
+            if not movie_url.startswith("http"):
+                if not movie_url.startswith("/"):
+                    movie_url = f"/{movie_url}"
+                movie_url = f"{kino_base}{movie_url}"
+
+            # Try to get sessions page
+            resp = await client.get(movie_url, params={"date": target_date})
+            logger.info(f"Movie page status={resp.status_code}, length={len(resp.text)}")
+            session_text = resp.text
 
             sessions = []
-            for block in soup.select(".session, .showtime, [data-session-id], .cinema-sessions"):
-                cinema_el = block.select_one(".cinema-name, .theater-name, h3, h4")
-                cinema_name = cinema_el.get_text(strip=True) if cinema_el else "—"
-                for time_el in block.select(".time, .session-time, a[href*='session'], .showtime-item"):
-                    time_text = time_el.get_text(strip=True)
-                    link = time_el.get("href", "") or (time_el.parent.get("href", "") if time_el.parent else "")
-                    buy_url = f"{kino_base}{link}" if link and not link.startswith("http") else link
-                    sessions.append({"cinema": cinema_name, "time": time_text, "buy_url": buy_url})
 
-            if cinema:
-                sessions = [s for s in sessions if cinema.lower() in s.get("cinema", "").lower()]
+            # Try extracting sessions from embedded JSON
+            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', session_text, re.DOTALL)
+            if next_data_match:
+                try:
+                    next_data = json.loads(next_data_match.group(1))
+                    page_props = next_data.get("props", {}).get("pageProps", {})
+                    for key in ["sessions", "showtimes", "schedules", "seances"]:
+                        if key in page_props:
+                            for s in page_props[key]:
+                                sessions.append({
+                                    "cinema": s.get("cinemaName") or s.get("cinema", {}).get("name", "—"),
+                                    "time": s.get("time") or s.get("startTime", ""),
+                                    "format": s.get("format") or s.get("technology", ""),
+                                    "price": s.get("price") or s.get("minPrice", ""),
+                                    "buy_url": f"{kino_base}/{city_slug}/session/{s.get('id', '')}" if s.get("id") else movie_url,
+                                })
+                except Exception as e:
+                    logger.info(f"Session __NEXT_DATA__ error: {e}")
 
-            return {"movie": best["title"], "date": target_date, "sessions": sessions,
-                    "count": len(sessions), "movie_url": f"{kino_base}{best['url']}"}
+            # Try HTML parsing for sessions
+            if not sessions:
+                soup = BeautifulSoup(session_text, "html.parser")
+                all_elements = soup.select("[class*='session'], [class*='showtime'], [class*='seance'], [class*='schedule'], [class*='cinema'], [data-session], [data-showtime]")
+                logger.info(f"Session elements found: {len(all_elements)}")
+                for el in all_elements[:5]:
+                    logger.info(f"  Session element: tag={el.name}, class={el.get('class')}, text={el.get_text(strip=True)[:80]}")
+
+            if cinema and sessions:
+                cinema_lower = cinema.lower()
+                sessions = [s for s in sessions if cinema_lower in s.get("cinema", "").lower()]
+
+            return {
+                "movie": best["title"],
+                "date": target_date,
+                "sessions": sessions,
+                "count": len(sessions),
+                "movie_url": movie_url,
+                "direct_search_url": f"{kino_base}/{city_slug}/search?query={movie}",
+            }
+
         except Exception as e:
-            return {"error": str(e), "fallback_url": f"{kino_base}/{city_slug}",
-                    "message": f"Не удалось загрузить Kino.kz. Прямая ссылка: {kino_base}/{city_slug}"}
+            logger.error(f"Kino.kz error: {e}")
+            return {
+                "error": str(e),
+                "kino_url": f"{kino_base}/{city_slug}",
+                "message": f"Ошибка при поиске. Прямая ссылка: {kino_base}/{city_slug}",
+            }
+
+
+async def list_cinema_movies(city="Алматы", cinema=""):
+    """List all movies currently showing, optionally filtered by cinema."""
+    city_slug = CITY_SLUGS.get(city.lower().strip(), "almaty")
+    kino_base = "https://kino.kz"
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    async with httpx.AsyncClient(timeout=25, headers=KINO_HEADERS, follow_redirects=True) as client:
+        try:
+            # Try main page which usually lists current movies
+            url = f"{kino_base}/{city_slug}"
+            if cinema:
+                url = f"{kino_base}/{city_slug}/cinema/{cinema.lower().replace(' ', '-')}"
+
+            resp = await client.get(url)
+            logger.info(f"Cinema page status={resp.status_code}, length={len(resp.text)}")
+            page_text = resp.text
+
+            movies = []
+            import re
+
+            # Try __NEXT_DATA__
+            next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', page_text, re.DOTALL)
+            if next_data_match:
+                try:
+                    next_data = json.loads(next_data_match.group(1))
+                    page_props = next_data.get("props", {}).get("pageProps", {})
+                    logger.info(f"Cinema page pageProps keys: {list(page_props.keys())[:15]}")
+                    for key in ["movies", "films", "items", "data", "nowShowing", "releases"]:
+                        if key in page_props:
+                            items = page_props[key]
+                            if isinstance(items, list):
+                                for item in items:
+                                    title = item.get("title") or item.get("name") or item.get("nameRu") or ""
+                                    if title:
+                                        movies.append({
+                                            "title": title,
+                                            "genre": item.get("genre") or item.get("genres", ""),
+                                            "rating": item.get("rating") or item.get("imdbRating", ""),
+                                            "url": f"{kino_base}/{city_slug}/movie/{item.get('slug', item.get('id', ''))}",
+                                        })
+                except Exception as e:
+                    logger.info(f"Cinema __NEXT_DATA__ error: {e}")
+
+            # Fallback: HTML parsing
+            if not movies:
+                soup = BeautifulSoup(page_text, "html.parser")
+                for link in soup.select("a[href*='/movie/'], a[href*='/film/']"):
+                    text = link.get_text(strip=True)
+                    href = link.get("href", "")
+                    if text and len(text) > 2:
+                        full_url = href if href.startswith("http") else f"{kino_base}{href}"
+                        movies.append({"title": text, "url": full_url})
+
+            # Deduplicate by title
+            seen = set()
+            unique_movies = []
+            for m in movies:
+                if m["title"] not in seen:
+                    seen.add(m["title"])
+                    unique_movies.append(m)
+
+            return {
+                "movies": unique_movies[:20],
+                "count": len(unique_movies),
+                "city": city,
+                "cinema": cinema or "все кинотеатры",
+                "kino_url": f"{kino_base}/{city_slug}",
+            }
+        except Exception as e:
+            logger.error(f"Cinema listing error: {e}")
+            return {"error": str(e), "kino_url": f"{kino_base}/{city_slug}"}
 
 
 # ── Voice transcription ──────────────────────────────────
@@ -221,6 +431,12 @@ TOOLS = [
          "cinema": {"type": "string", "description": "Кинотеатр (опц.)"},
          "date": {"type": "string", "description": "Дата YYYY-MM-DD (опц.)"},
      }, "required": ["movie"]}},
+    {"name": "list_cinema_movies",
+     "description": "Показать все фильмы которые сейчас идут в кинотеатрах. Используй когда пользователь спрашивает 'что идёт в кино', 'какие фильмы в Chaplin' и т.д.",
+     "input_schema": {"type": "object", "properties": {
+         "city": {"type": "string", "description": "Город (по умолч. Алматы)"},
+         "cinema": {"type": "string", "description": "Конкретный кинотеатр (опц.)"},
+     }, "required": []}},
 ]
 
 
@@ -229,6 +445,7 @@ async def execute_tool(name, params):
         if name == "create_calendar_event": result = await create_event(**params)
         elif name == "list_calendar_events": result = await list_events(**params)
         elif name == "search_movie_sessions": result = await search_movie_sessions(**params)
+        elif name == "list_cinema_movies": result = await list_cinema_movies(**params)
         else: result = {"error": f"Unknown tool: {name}"}
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
